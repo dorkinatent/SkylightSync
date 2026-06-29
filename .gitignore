@@ -1,6 +1,7 @@
 .env
 data/
 downloads/
+backfill/
 local-n8n/
 __pycache__/
 *.pyc
