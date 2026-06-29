@@ -1,0 +1,11 @@
+.env
+data/
+downloads/
+local-n8n/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+.pytest_cache/
+chromedriver
+*.log
