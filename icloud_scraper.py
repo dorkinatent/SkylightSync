@@ -6,11 +6,9 @@ from datetime import datetime
 
 import requests
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.common.keys import Keys
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from state_store import StateStore, normalize_url
@@ -63,34 +61,77 @@ class ICloudPhotoScraper:
         response.raise_for_status()
         return response.content
 
-    def _collect_photo_urls(self, driver: webdriver.Chrome) -> list[str]:
+    def _open_first_photo(self, driver: webdriver.Chrome) -> bool:
+        """Open the carousel by clicking the first photo. Returns False if none found."""
+        view_buttons = driver.find_elements(By.CSS_SELECTOR, "[role='button'][aria-label*='of']")
+        if view_buttons:
+            view_buttons[0].click()
+            time.sleep(1)
+            return True
+
+        containers = driver.find_elements(
+            By.CSS_SELECTOR,
+            ".x-stream-photo-grid-item-view, [class*='photo'], [class*='grid-item']",
+        )
+        if containers:
+            containers[0].click()
+            time.sleep(1)
+            return True
+
+        logger.warning("No clickable photo elements found on album page")
+        return False
+
+    def _collect_photo_urls(self, driver: webdriver.Chrome, max_photos: int = 5000) -> list[str]:
+        """Step through the iCloud carousel collecting each photo's URL.
+
+        The shared-album grid is virtualized (only a few <img> tags exist at
+        once), so we open a photo and advance through the carousel, gathering
+        unique image URLs until we loop back to the first one.
+        """
         driver.get(self.album_url)
         time.sleep(5)
 
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "image-container"))
-            )
-        except TimeoutException:
-            logger.warning("Primary selector not found, trying alternative photo elements...")
-
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        while True:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                break
-            last_height = new_height
+        if not self._open_first_photo(driver):
+            return []
 
         urls: list[str] = []
-        for element in driver.find_elements(By.TAG_NAME, "img"):
-            src = element.get_attribute("src")
-            if not src or "icloud" not in src:
-                continue
-            if any(keyword in src for keyword in ["thumb", "icon", "logo"]):
-                continue
-            urls.append(src)
+        seen: set[str] = set()
+        first_url: str | None = None
+        consecutive_duplicates = 0
+
+        for count in range(max_photos):
+            time.sleep(0.25)
+            carousel_images = driver.find_elements(By.CSS_SELECTOR, "img[src*='icloud']")
+            if not carousel_images:
+                logger.info("No image in carousel at photo %d, stopping", count + 1)
+                break
+
+            image_url = carousel_images[0].get_attribute("src")
+            if image_url and image_url not in seen:
+                seen.add(image_url)
+                urls.append(image_url)
+                consecutive_duplicates = 0
+                if first_url is None:
+                    first_url = image_url
+            elif image_url:
+                consecutive_duplicates += 1
+                if consecutive_duplicates > 10:
+                    logger.info("Stopping carousel: duplicate loop detected")
+                    break
+
+            if first_url and image_url == first_url and count > 0:
+                logger.info("Reached the first photo again, carousel complete")
+                break
+
+            try:
+                driver.find_element(
+                    By.CSS_SELECTOR, "[aria-label='Next'], .next, [data-testid='next']"
+                ).click()
+            except Exception:
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ARROW_RIGHT)
+            time.sleep(0.1)
+
+        logger.info("Carousel navigation finished: %d unique photo URLs", len(urls))
         return urls
 
     def scrape_photos(self) -> list[str]:

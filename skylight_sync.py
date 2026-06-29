@@ -39,21 +39,22 @@ def main() -> None:
     load_dotenv()
 
     ICLOUD_ALBUM_URL = os.getenv("ICLOUD_ALBUM_URL")
-    RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+    # Accept legacy variable names (TO_EMAIL/SMTP_USERNAME/SMTP_PASSWORD) as aliases.
+    RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL") or os.getenv("TO_EMAIL")
 
     if not ICLOUD_ALBUM_URL or not RECIPIENT_EMAIL:
         logger.error("Album URL and recipient email not configured!")
-        logger.error("Please set ICLOUD_ALBUM_URL and RECIPIENT_EMAIL environment variables")
+        logger.error("Please set ICLOUD_ALBUM_URL and RECIPIENT_EMAIL (or TO_EMAIL)")
         sys.exit(1)
 
     SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-    SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-    SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
+    SENDER_EMAIL = os.getenv("SENDER_EMAIL") or os.getenv("SMTP_USERNAME")
+    SENDER_PASSWORD = os.getenv("SENDER_PASSWORD") or os.getenv("SMTP_PASSWORD")
 
     if not SENDER_EMAIL or not SENDER_PASSWORD:
         logger.error("Email credentials not configured!")
-        logger.error("Please set SENDER_EMAIL and SENDER_PASSWORD environment variables")
+        logger.error("Please set SENDER_EMAIL/SENDER_PASSWORD (or SMTP_USERNAME/SMTP_PASSWORD)")
         sys.exit(1)
 
     scraper = ICloudPhotoScraper(ICLOUD_ALBUM_URL)
