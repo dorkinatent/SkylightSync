@@ -1,0 +1,4 @@
+# Every change to this repo requires review from the owner.
+# Combined with "Require review from Code Owners" branch protection on main,
+# this means no PR can merge without @dorkinatent's approval.
+* @dorkinatent
