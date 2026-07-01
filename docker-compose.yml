@@ -2,7 +2,10 @@ version: '3.8'
 
 services:
   skylight-sync:
+    # Build locally by default. To use the pre-built image from GHCR instead,
+    # comment out `build: .` and uncomment the `image:` line below.
     build: .
+    # image: ghcr.io/dorkinatent/skylightsync:latest
     container_name: skylight-sync
     restart: unless-stopped
     environment:
