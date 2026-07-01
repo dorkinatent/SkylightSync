@@ -76,6 +76,58 @@ class TestGuidDedupOnSkip:
             assert scraper.scrape_photos() == []
 
 
+class TestVideoSkip:
+    """Videos are skipped (photos-only) and left unmarked so a later policy
+    change could still pick them up."""
+
+    def test_videos_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scraper = _scraper(tmpdir)
+            scraper._fetch_stream = lambda: [
+                {"photoGuid": "V1", "mediaAssetType": "video",
+                 "derivatives": {"720p": {"checksum": "vc", "fileSize": "999"}},
+                 "dateCreated": "2026-01-01T00:00:00Z"},
+            ]
+            scraper._resolve_asset_urls = lambda guids: (_ for _ in ()).throw(
+                AssertionError("videos should never be resolved")
+            )
+            assert scraper.scrape_photos() == []
+            assert scraper.state_store.seen_guids() == set()  # not marked
+
+
+class TestDeferredCommit:
+    """A downloaded photo is returned but NOT committed until the caller sends it."""
+
+    def test_successful_download_is_pending_not_committed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scraper = _scraper(tmpdir)
+            scraper._fetch_stream = lambda: [
+                {"photoGuid": "P1", "derivatives": {"100": {"checksum": "c1", "fileSize": "3"}},
+                 "dateCreated": "2026-01-01T00:00:00Z"},
+            ]
+            scraper._resolve_asset_urls = lambda guids: {"c1": "https://x/IMG_1.JPG?s=t"}
+            scraper._download = lambda url: b"img"
+
+            pending = scraper.scrape_photos()
+
+            assert len(pending) == 1
+            item = pending[0]
+            assert item["guid"] == "P1" and item["size"] == 3
+            assert os.path.exists(item["path"])
+            # Deferred: nothing committed to any dedup layer yet.
+            assert scraper.state_store.seen_guids() == set()
+            assert scraper.state_store.seen_hashes() == set()
+
+            # Caller commits after a successful send.
+            scraper.state_store.commit_photo(
+                photo_guid=item["guid"], photo_hash=item["hash"], filename=item["filename"],
+                url=item["url"], normalized_url=item["normalized"], timestamp=item["timestamp"],
+            )
+            assert scraper.state_store.seen_guids() == {"P1"}
+            # Now it's skipped on the next run.
+            assert scraper.scrape_photos() == []
+
+
 class TestDirectories:
     def test_creates_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:

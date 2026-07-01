@@ -140,7 +140,22 @@ class ICloudPhotoScraper:
 
     # -- public API ------------------------------------------------------------
 
-    def scrape_photos(self) -> list[str]:
+    @staticmethod
+    def _is_video(photo: dict) -> bool:
+        return photo.get("mediaAssetType") == "video"
+
+    def scrape_photos(self) -> list[dict]:
+        """Download new (non-video) photos and return uncommitted descriptors.
+
+        State is intentionally NOT written for successfully downloaded photos:
+        the caller commits each one (via ``state_store.commit_photo``) only after
+        it has been emailed, so a failed send never orphans a photo as "seen but
+        never delivered". Structurally unsupported entries (no derivative / no
+        asset URL) are marked here, since they can never be delivered.
+
+        Each returned item is a dict with keys: path, filename, guid, hash, url,
+        normalized, timestamp, size.
+        """
         try:
             photos = self._fetch_stream()
         except Exception as e:
@@ -150,13 +165,20 @@ class ICloudPhotoScraper:
         logger.info("Album web-stream returned %d photo(s)", len(photos))
 
         seen_guids = self.state_store.seen_guids()
+        unseen = [p for p in photos if p.get("photoGuid") and p["photoGuid"] not in seen_guids]
+
+        # Photos-only: skip videos. They are left unmarked (not recorded as
+        # processed) so they're simply ignored each run.
+        videos = sum(1 for p in unseen if self._is_video(p))
+        if videos:
+            logger.info("Skipping %d video(s) (photos-only mode)", videos)
         # Oldest first, so batched emails arrive in chronological order.
         new = sorted(
-            (p for p in photos if p.get("photoGuid") and p["photoGuid"] not in seen_guids),
+            (p for p in unseen if not self._is_video(p)),
             key=lambda p: p.get("dateCreated", ""),
         )
         if not new:
-            logger.info("No new photos (all %d GUIDs already processed)", len(photos))
+            logger.info("No new photos to send")
             return []
         logger.info("%d new photo(s) after GUID dedup", len(new))
 
@@ -176,7 +198,7 @@ class ICloudPhotoScraper:
         asset_urls = self._resolve_asset_urls(list(chosen.keys()))
 
         seen_hashes = self.state_store.seen_hashes()
-        downloaded: list[str] = []
+        pending: list[dict] = []
 
         for idx, (guid, (checksum, photo)) in enumerate(chosen.items()):
             url = asset_urls.get(checksum)
@@ -193,6 +215,7 @@ class ICloudPhotoScraper:
             try:
                 data = self._download(url)
             except Exception as e:
+                # Transient: leave unmarked so it retries on the next run.
                 logger.error("Error downloading photo %s: %s", guid, e)
                 continue
 
@@ -200,22 +223,31 @@ class ICloudPhotoScraper:
             timestamp = photo.get("dateCreated") or datetime.now().strftime("%Y%m%d_%H%M%S")
 
             # Content-level dedup: same image re-added under a new GUID/URL.
+            # This is a confirmed duplicate (not pending a send), so commit the
+            # GUID immediately and don't queue it for email.
             if photo_hash in seen_hashes:
                 logger.debug("Photo %s already seen by content hash, skipping send", guid)
-            else:
-                filename = self._filename(photo, url, idx)
-                filepath = os.path.join(self.download_dir, filename)
-                with open(filepath, "wb") as f:
-                    f.write(data)
+                self.state_store.mark_guid_processed(guid, photo_hash)
+                continue
 
-                self.state_store.add_photo(photo_hash, filename, url, timestamp)
-                self.state_store.mark_url_processed(self.normalize_url(url), photo_hash, url)
-                seen_hashes.add(photo_hash)
-                downloaded.append(filepath)
-                logger.info("Downloaded new photo: %s", filename)
+            filename = self._filename(photo, url, idx)
+            filepath = os.path.join(self.download_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(data)
+            seen_hashes.add(photo_hash)
+            pending.append(
+                {
+                    "path": filepath,
+                    "filename": filename,
+                    "guid": guid,
+                    "hash": photo_hash,
+                    "url": url,
+                    "normalized": self.normalize_url(url),
+                    "timestamp": timestamp,
+                    "size": len(data),
+                }
+            )
+            logger.info("Downloaded new photo: %s (%d bytes)", filename, len(data))
 
-            # Always record the GUID so it is never re-fetched, dup or not.
-            self.state_store.mark_guid_processed(guid, photo_hash)
-
-        logger.info("Downloaded %d new photo file(s)", len(downloaded))
-        return downloaded
+        logger.info("%d photo(s) downloaded and ready to send", len(pending))
+        return pending

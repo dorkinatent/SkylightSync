@@ -158,6 +158,24 @@ class StateStore:
             rows = conn.execute("SELECT photo_hash FROM photos").fetchall()
         return {row["photo_hash"] for row in rows}
 
+    def commit_photo(
+        self,
+        *,
+        photo_guid: str,
+        photo_hash: str,
+        filename: str,
+        url: str | None,
+        normalized_url: str,
+        timestamp: str,
+    ) -> None:
+        """Record a photo as fully processed — call only after it has been sent.
+
+        Writes all three dedup layers (content hash, URL, GUID) together so a
+        delivered photo is never re-fetched or re-sent."""
+        self.add_photo(photo_hash, filename, url, timestamp)
+        self.mark_url_processed(normalized_url, photo_hash, url)
+        self.mark_guid_processed(photo_guid, photo_hash)
+
     def add_photo(self, photo_hash: str, filename: str, url: str | None, timestamp: str) -> None:
         with self._connection() as conn:
             conn.execute(
