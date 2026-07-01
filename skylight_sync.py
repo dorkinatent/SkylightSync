@@ -14,13 +14,42 @@ from icloud_scraper import ICloudPhotoScraper
 
 logger = logging.getLogger(__name__)
 
+# Gmail rejects messages over 25 MB. base64 attachment encoding inflates size by
+# ~37%, so keep raw attachment bytes per email comfortably under that.
+MAX_ATTACHMENT_BYTES_PER_EMAIL = 18 * 1024 * 1024
 
-def cleanup_photos(photo_paths: list[str]) -> None:
-    for path in photo_paths:
+
+def _remove_files(paths: list[str]) -> None:
+    for path in paths:
         try:
             os.remove(path)
         except OSError as e:
             logger.warning("Could not delete %s: %s", path, e)
+
+
+def plan_batches(
+    pending: list[dict], max_count: int, max_bytes: int
+) -> tuple[list[list[dict]], list[dict]]:
+    """Pack pending photos into batches that stay under both the per-email count
+    and byte limits. Any single photo larger than the byte limit can't be
+    emailed at all and is returned separately as ``oversized``."""
+    oversized = [p for p in pending if p["size"] > max_bytes]
+    fits = [p for p in pending if p["size"] <= max_bytes]
+
+    batches: list[list[dict]] = []
+    batch: list[dict] = []
+    size = 0
+    for item in fits:
+        over_count = max_count > 0 and len(batch) >= max_count
+        over_bytes = size + item["size"] > max_bytes
+        if batch and (over_count or over_bytes):
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(item)
+        size += item["size"]
+    if batch:
+        batches.append(batch)
+    return batches, oversized
 
 
 def main() -> None:
@@ -66,32 +95,65 @@ def main() -> None:
     logger.info("Check interval: %d seconds", args.interval)
     logger.info("Batch size: %d photos per email", args.batch_size)
 
+    def commit_and_cleanup(item: dict) -> None:
+        scraper.state_store.commit_photo(
+            photo_guid=item["guid"],
+            photo_hash=item["hash"],
+            filename=item["filename"],
+            url=item["url"],
+            normalized_url=item["normalized"],
+            timestamp=item["timestamp"],
+        )
+        if not args.keep_photos:
+            _remove_files([item["path"]])
+
     def sync_photos() -> None:
         logger.info("Checking for new photos...")
 
         try:
-            new_photos = scraper.scrape_photos()
-
-            if new_photos:
-                logger.info("Found %d new photo(s)", len(new_photos))
-
-                if args.batch_size > 0:
-                    success = email_sender.send_photos_in_batches(
-                        RECIPIENT_EMAIL,
-                        new_photos,
-                        batch_size=args.batch_size,
-                    )
-                else:
-                    success = email_sender.send_photos(RECIPIENT_EMAIL, new_photos)
-
-                if success:
-                    logger.info("Successfully sent %d photo(s) to %s", len(new_photos), RECIPIENT_EMAIL)
-                    if not args.keep_photos:
-                        cleanup_photos(new_photos)
-                else:
-                    logger.error("Failed to send some or all photos")
-            else:
+            pending = scraper.scrape_photos()
+            if not pending:
                 logger.info("No new photos found")
+                return
+
+            logger.info("Found %d new photo(s) to send", len(pending))
+            count_cap = args.batch_size if args.batch_size > 0 else len(pending)
+            batches, oversized = plan_batches(pending, count_cap, MAX_ATTACHMENT_BYTES_PER_EMAIL)
+
+            # A single photo too large to email can never be delivered. Mark only
+            # its GUID as handled so it isn't retried forever — do NOT record it
+            # in the delivered-photos/hash state (it was never sent).
+            for item in oversized:
+                logger.warning(
+                    "Photo %s is %d bytes — too large to email; skipping permanently",
+                    item["filename"],
+                    item["size"],
+                )
+                scraper.state_store.mark_guid_processed(item["guid"], None)
+                if not args.keep_photos:
+                    _remove_files([item["path"]])
+
+            sent = 0
+            for i, batch in enumerate(batches, 1):
+                subject = f"New photos from iCloud album - batch {i}/{len(batches)}"
+                if email_sender.send_photos(RECIPIENT_EMAIL, [b["path"] for b in batch], subject):
+                    # Commit only after a confirmed send, so a failure never
+                    # orphans photos as "seen but never delivered".
+                    for item in batch:
+                        commit_and_cleanup(item)
+                    sent += len(batch)
+                    logger.info("Sent batch %d/%d (%d photo(s)); total sent %d",
+                                i, len(batches), len(batch), sent)
+                else:
+                    remaining = sum(len(b) for b in batches[i - 1:])
+                    logger.error(
+                        "Batch %d failed to send; leaving %d photo(s) for the next run",
+                        i, remaining,
+                    )
+                    break
+
+            logger.info("Sync complete: sent %d of %d new photo(s) to %s",
+                        sent, len(pending), RECIPIENT_EMAIL)
 
         except Exception as e:
             logger.error("Error during sync: %s", e)

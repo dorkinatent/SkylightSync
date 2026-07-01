@@ -158,6 +158,50 @@ class StateStore:
             rows = conn.execute("SELECT photo_hash FROM photos").fetchall()
         return {row["photo_hash"] for row in rows}
 
+    def commit_photo(
+        self,
+        *,
+        photo_guid: str,
+        photo_hash: str,
+        filename: str,
+        url: str | None,
+        normalized_url: str,
+        timestamp: str,
+    ) -> None:
+        """Record a photo as fully processed — call only after it has been sent.
+
+        Writes all three dedup layers (content hash, URL, GUID) in a single
+        transaction so a delivered photo is never left half-recorded, re-fetched,
+        or re-sent."""
+        now = datetime.now().isoformat()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO photos (photo_hash, filename, url, timestamp, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(photo_hash) DO UPDATE SET
+                    filename = excluded.filename,
+                    url = excluded.url,
+                    timestamp = excluded.timestamp
+                """,
+                (photo_hash, filename, url, timestamp, now),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO processed_urls
+                    (normalized_url, photo_hash, original_url, processed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (normalized_url, photo_hash, url, now),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO processed_guids (photo_guid, photo_hash, processed_at)
+                VALUES (?, ?, ?)
+                """,
+                (photo_guid, photo_hash, now),
+            )
+
     def add_photo(self, photo_hash: str, filename: str, url: str | None, timestamp: str) -> None:
         with self._connection() as conn:
             conn.execute(
