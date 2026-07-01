@@ -1,12 +1,32 @@
-.env
+# VCS / project meta
 .git
 .gitignore
-__pycache__
-*.pyc
-.DS_Store
-downloads/*
-data/*
-README.md
+.github/
 .dockerignore
 Dockerfile
 docker-compose.yml
+README.md
+email_setup_guide.md
+
+# Python envs & caches (never copy the host virtualenv into the image)
+venv/
+.venv/
+__pycache__
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Tests aren't needed at runtime
+tests/
+
+# Local data, secrets, and logs
+.env
+.env.example
+data/
+downloads/
+backfill/
+chrome-data/
+local-n8n/
+*.log
+*.db
+.DS_Store

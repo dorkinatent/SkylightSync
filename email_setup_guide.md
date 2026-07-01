@@ -17,20 +17,10 @@
    SENDER_PASSWORD=your-16-char-app-password
    ```
 
-## Option 2: SendGrid (Recommended for Production)
+> **Note:** SkylightSync currently supports SMTP only. Use one of the SMTP
+> options below (Gmail, Outlook, or a custom domain).
 
-1. Sign up at https://sendgrid.com (free tier: 100 emails/day)
-2. Create an API key:
-   - Settings → API Keys → Create API Key
-   - Give it "Mail Send" permissions
-3. Use in `.env`:
-   ```
-   EMAIL_PROVIDER=sendgrid
-   SENDGRID_API_KEY=your-api-key
-   SENDER_EMAIL=noreply@yourdomain.com
-   ```
-
-## Option 3: Outlook/Hotmail
+## Option 2: Outlook/Hotmail
 
 1. Use your Microsoft account
 2. Enable 2-factor authentication
@@ -43,7 +33,7 @@
    SENDER_PASSWORD=your-app-password
    ```
 
-## Option 4: Custom Domain Email
+## Option 3: Custom Domain Email
 
 Use your hosting provider's SMTP settings. Common providers:
 
@@ -68,4 +58,3 @@ SENDER_PASSWORD=your-app-password
 - Never commit credentials to git
 - Use app-specific passwords, not your main password
 - Consider creating a dedicated email account for this service
-- For production use, consider using an email API service like SendGrid

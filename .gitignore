@@ -8,5 +8,6 @@ __pycache__/
 .DS_Store
 .claude/
 .pytest_cache/
-chromedriver
+.ruff_cache/
+chrome-data/
 *.log
