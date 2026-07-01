@@ -161,6 +161,9 @@ class ICloudPhotoScraper:
         logger.info("%d new photo(s) after GUID dedup", len(new))
 
         # Choose the best derivative per photo, then resolve all URLs in bulk.
+        # A photo with no usable derivative is structurally unsupported (not a
+        # transient failure), so record its GUID now to avoid reprocessing it
+        # on every future sync.
         chosen: dict[str, tuple[str, dict]] = {}
         for p in new:
             deriv = self._best_derivative(p)
@@ -168,6 +171,7 @@ class ICloudPhotoScraper:
                 chosen[p["photoGuid"]] = (deriv["checksum"], p)
             else:
                 logger.warning("No usable derivative for photo %s", p.get("photoGuid"))
+                self.state_store.mark_guid_processed(p["photoGuid"], None)
 
         asset_urls = self._resolve_asset_urls(list(chosen.keys()))
 
@@ -177,7 +181,13 @@ class ICloudPhotoScraper:
         for idx, (guid, (checksum, photo)) in enumerate(chosen.items()):
             url = asset_urls.get(checksum)
             if not url:
+                # webasseturls returned no URL for this derivative in an
+                # otherwise-successful response: treat as permanent and record
+                # the GUID so it isn't retried forever. (A failed webasseturls
+                # POST raises earlier and aborts the whole run, so nothing is
+                # marked in that transient case.)
                 logger.warning("No asset URL resolved for photo %s", guid)
+                self.state_store.mark_guid_processed(guid, None)
                 continue
 
             try:

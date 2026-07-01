@@ -37,6 +37,11 @@ DB_PATH = "data/skylight.db"
 def main() -> None:
     ap = argparse.ArgumentParser(description="Backfill current album GUIDs as processed")
     ap.add_argument("--dry-run", action="store_true", help="report only; write nothing")
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="stamp GUIDs even if the DB looks incomplete (skip the safety check)",
+    )
     args = ap.parse_args()
 
     load_dotenv()
@@ -52,10 +57,26 @@ def main() -> None:
     guids = [p["photoGuid"] for p in photos if p.get("photoGuid")]
     already = store.seen_guids()
     new = [g for g in guids if g not in already]
+    known_photos = len(store.seen_hashes())
 
     logger.info("Album photos: %d", len(photos))
+    logger.info("Photos already in DB (content hashes): %d", known_photos)
     logger.info("GUIDs already recorded: %d", len(already))
     logger.info("GUIDs to stamp this run: %d", len(new))
+
+    # Safety precondition: this tool assumes everything in the album has already
+    # been emailed (so we can mark GUIDs processed without downloading). That
+    # only holds when the DB already knows about at least as many photos as the
+    # album contains. On a fresh or partially restored DB, stamping would make
+    # the next sync skip real, un-emailed photos forever.
+    if known_photos < len(guids) and not args.force:
+        logger.error(
+            "Refusing to backfill: DB has %d photos but the album has %d. "
+            "The DB looks incomplete; validate it first, or pass --force to override.",
+            known_photos,
+            len(guids),
+        )
+        sys.exit(1)
 
     if args.dry_run:
         logger.info("DRY RUN: no changes written.")
