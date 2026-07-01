@@ -64,6 +64,12 @@ class StateStore:
                     original_url TEXT,
                     processed_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS processed_guids (
+                    photo_guid TEXT PRIMARY KEY,
+                    photo_hash TEXT,
+                    processed_at TEXT NOT NULL
+                );
                 """
             )
         self._migrate_legacy_json_if_needed()
@@ -114,6 +120,30 @@ class StateStore:
                 VALUES (?, ?, ?, ?)
                 """,
                 (normalized_url, photo_hash, original_url, datetime.now().isoformat()),
+            )
+
+    def seen_guids(self) -> set[str]:
+        """Every iCloud photoGuid already processed — the primary dedup key.
+
+        The webstream API gives each photo a stable GUID, so we can skip
+        already-seen photos before downloading (or even resolving) anything.
+        """
+        with self._connection() as conn:
+            rows = conn.execute("SELECT photo_guid FROM processed_guids").fetchall()
+        return {row["photo_guid"] for row in rows}
+
+    def mark_guid_processed(self, photo_guid: str, photo_hash: str | None) -> None:
+        """Record a GUID as handled so it is never re-fetched.
+
+        Called even when the content hash was a duplicate, so a photo re-added
+        to the album under a new GUID is still fetched exactly once."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO processed_guids (photo_guid, photo_hash, processed_at)
+                VALUES (?, ?, ?)
+                """,
+                (photo_guid, photo_hash, datetime.now().isoformat()),
             )
 
     def has_hash(self, photo_hash: str) -> bool:

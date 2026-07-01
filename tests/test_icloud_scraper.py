@@ -45,6 +45,37 @@ class TestNormalizeUrl:
             assert a == b
 
 
+class TestGuidDedupOnSkip:
+    """Unsupported photos must still be recorded so they aren't retried forever."""
+
+    def test_photos_without_usable_asset_are_marked_processed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scraper = _scraper(tmpdir)
+
+            # G1: no derivatives at all. G2: has a derivative, but its checksum
+            # won't resolve to a URL below.
+            scraper._fetch_stream = lambda: [
+                {"photoGuid": "G1", "derivatives": {}, "dateCreated": "2026-01-01T00:00:00Z"},
+                {
+                    "photoGuid": "G2",
+                    "derivatives": {"100": {"checksum": "c2", "fileSize": "10"}},
+                    "dateCreated": "2026-01-02T00:00:00Z",
+                },
+            ]
+            scraper._resolve_asset_urls = lambda guids: {}  # nothing resolves
+
+            downloaded = scraper.scrape_photos()
+
+            assert downloaded == []
+            assert scraper.state_store.seen_guids() == {"G1", "G2"}
+
+            # A second run sees them as already processed and does no work.
+            scraper._resolve_asset_urls = lambda guids: (_ for _ in ()).throw(
+                AssertionError("should not resolve already-processed GUIDs")
+            )
+            assert scraper.scrape_photos() == []
+
+
 class TestDirectories:
     def test_creates_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
