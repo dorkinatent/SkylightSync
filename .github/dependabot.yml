@@ -1,17 +1,26 @@
 version: 2
 updates:
   # Keep GitHub Actions pinned versions current (security patches for CI).
+  # Monthly, and grouped into a single PR so updates don't arrive piecemeal.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
     commit-message:
       prefix: ci
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
-  # Keep Python dependencies current.
+  # Keep Python dependencies current. Monthly, all bumps in one grouped PR.
   - package-ecosystem: pip
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
     commit-message:
       prefix: deps
+    groups:
+      python:
+        patterns:
+          - "*"
