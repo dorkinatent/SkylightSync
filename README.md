@@ -120,6 +120,17 @@ Example crontab entry — sync every day at 7am and append output to a log:
 2. Generate an app-specific password at https://myaccount.google.com/apppasswords
 3. Use this password in the `.env` file
 
+## Development
+
+Runtime dependencies live in `requirements.txt`; test/lint tooling lives in
+`requirements-dev.txt`.
+
+```bash
+pip install -r requirements-dev.txt
+pytest          # run the test suite
+ruff check .    # lint
+```
+
 ## Files Created
 
 - `downloads/` - Directory where photos are temporarily stored
