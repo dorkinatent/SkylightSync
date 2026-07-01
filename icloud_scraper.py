@@ -1,19 +1,47 @@
+"""Fetch photos from a public iCloud shared album via its JSON web-stream API.
+
+iCloud shared albums expose an undocumented but stable JSON API instead of
+needing a headless browser to walk the photo carousel:
+
+* POST .../sharedstreams/webstream    -> every photo with a stable ``photoGuid``,
+                                          derivative sizes, and metadata.
+* POST .../sharedstreams/webasseturls -> short-lived signed download URLs,
+                                          keyed by each derivative's checksum.
+
+The first request to the base host answers 330 with an ``X-Apple-MMe-Host``
+pointing at the album's real partition; we cache that host and re-issue there.
+"""
+
 import hashlib
+import json
 import logging
 import os
-import time
 from datetime import datetime
 
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from state_store import StateStore, normalize_url
 
 logger = logging.getLogger(__name__)
+
+# Any partition host works for the initial call; it 330-redirects to the right one.
+BASE_HOST = "p01-sharedstreams.icloud.com"
+
+# The endpoints expect a raw JSON body (text/plain) with a browser-like origin.
+_HEADERS = {
+    "Content-Type": "text/plain",
+    "Origin": "https://www.icloud.com",
+    "Referer": "https://www.icloud.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    ),
+}
+
+# webasseturls resolves every derivative of the GUIDs passed in one call; chunk
+# so a large album doesn't produce an oversized request.
+_GUID_CHUNK = 25
 
 
 class ICloudPhotoScraper:
@@ -25,6 +53,7 @@ class ICloudPhotoScraper:
         state_store: StateStore | None = None,
     ) -> None:
         self.album_url = album_url
+        self.token = self._parse_token(album_url)
         self.download_dir = download_dir
         self.data_dir = data_dir
 
@@ -33,156 +62,150 @@ class ICloudPhotoScraper:
 
         self.state_store = state_store or StateStore(os.path.join(data_dir, "skylight.db"))
 
+        self.session = requests.Session()
+        self.session.headers.update(_HEADERS)
+        self._host: str | None = None
+
+    @staticmethod
+    def _parse_token(album_url: str) -> str:
+        """Extract the album token, e.g. ``B2U5Uzl7VCG6vv`` from
+        ``https://www.icloud.com/sharedalbum/#B2U5Uzl7VCG6vv``."""
+        if "#" in album_url:
+            token = album_url.split("#", 1)[1]
+        else:
+            token = album_url.rstrip("/").rsplit("/", 1)[-1]
+        return token.strip("/ ")
+
     def normalize_url(self, url: str) -> str:
         return normalize_url(url)
 
     def get_photo_hash(self, photo_data: bytes) -> str:
         return hashlib.md5(photo_data).hexdigest()
 
-    def setup_driver(self) -> webdriver.Chrome:
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-
-        if os.environ.get("CHROME_BIN"):
-            chrome_options.binary_location = os.environ["CHROME_BIN"]
-
-        return webdriver.Chrome(options=chrome_options)
+    # -- iCloud web-stream API -------------------------------------------------
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-    def _download_image(self, url: str) -> bytes:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return response.content
+    def _post(self, endpoint: str, body: dict) -> dict:
+        host = self._host or BASE_HOST
+        url = f"https://{host}/{self.token}/sharedstreams/{endpoint}"
+        resp = self.session.post(url, data=json.dumps(body), timeout=45)
+        # 330 == "wrong partition, use this host"; cache it and retry once.
+        if resp.status_code == 330:
+            self._host = resp.json()["X-Apple-MMe-Host"]
+            url = f"https://{self._host}/{self.token}/sharedstreams/{endpoint}"
+            resp = self.session.post(url, data=json.dumps(body), timeout=45)
+        resp.raise_for_status()
+        return resp.json()
 
-    def _open_first_photo(self, driver: webdriver.Chrome) -> bool:
-        """Open the carousel by clicking the first photo. Returns False if none found."""
-        view_buttons = driver.find_elements(By.CSS_SELECTOR, "[role='button'][aria-label*='of']")
-        if view_buttons:
-            view_buttons[0].click()
-            time.sleep(1)
-            return True
+    def _fetch_stream(self) -> list[dict]:
+        return self._post("webstream", {"streamCtag": None}).get("photos", [])
 
-        containers = driver.find_elements(
-            By.CSS_SELECTOR,
-            ".x-stream-photo-grid-item-view, [class*='photo'], [class*='grid-item']",
-        )
-        if containers:
-            containers[0].click()
-            time.sleep(1)
-            return True
+    def _resolve_asset_urls(self, guids: list[str]) -> dict[str, str]:
+        """Map each derivative checksum -> a signed download URL."""
+        items: dict[str, dict] = {}
+        locations: dict[str, dict] = {}
+        for i in range(0, len(guids), _GUID_CHUNK):
+            data = self._post("webasseturls", {"photoGuids": guids[i : i + _GUID_CHUNK]})
+            items.update(data.get("items", {}))
+            locations.update(data.get("locations", {}))
 
-        logger.warning("No clickable photo elements found on album page")
-        return False
-
-    def _collect_photo_urls(self, driver: webdriver.Chrome, max_photos: int = 5000) -> list[str]:
-        """Step through the iCloud carousel collecting each photo's URL.
-
-        The shared-album grid is virtualized (only a few <img> tags exist at
-        once), so we open a photo and advance through the carousel, gathering
-        unique image URLs until we loop back to the first one.
-        """
-        driver.get(self.album_url)
-        time.sleep(5)
-
-        if not self._open_first_photo(driver):
-            return []
-
-        urls: list[str] = []
-        seen: set[str] = set()
-        first_url: str | None = None
-        consecutive_duplicates = 0
-
-        for count in range(max_photos):
-            time.sleep(0.25)
-            carousel_images = driver.find_elements(By.CSS_SELECTOR, "img[src*='icloud']")
-            if not carousel_images:
-                logger.info("No image in carousel at photo %d, stopping", count + 1)
-                break
-
-            image_url = carousel_images[0].get_attribute("src")
-            if image_url and image_url not in seen:
-                seen.add(image_url)
-                urls.append(image_url)
-                consecutive_duplicates = 0
-                if first_url is None:
-                    first_url = image_url
-            elif image_url:
-                consecutive_duplicates += 1
-                if consecutive_duplicates > 10:
-                    logger.info("Stopping carousel: duplicate loop detected")
-                    break
-
-            if first_url and image_url == first_url and count > 0:
-                logger.info("Reached the first photo again, carousel complete")
-                break
-
-            try:
-                driver.find_element(
-                    By.CSS_SELECTOR, "[aria-label='Next'], .next, [data-testid='next']"
-                ).click()
-            except Exception:
-                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ARROW_RIGHT)
-            time.sleep(0.1)
-
-        logger.info("Carousel navigation finished: %d unique photo URLs", len(urls))
+        urls: dict[str, str] = {}
+        for checksum, item in items.items():
+            loc = item.get("url_location")
+            hosts = locations.get(loc, {}).get("hosts", [loc])
+            scheme = locations.get(loc, {}).get("scheme", "https")
+            urls[checksum] = f"{scheme}://{hosts[0]}{item.get('url_path', '')}"
         return urls
 
+    @staticmethod
+    def _best_derivative(photo: dict) -> dict | None:
+        """The highest-quality derivative (largest file) for a photo record."""
+        derivatives = photo.get("derivatives") or {}
+        usable = [d for d in derivatives.values() if d.get("checksum")]
+        if not usable:
+            return None
+        return max(usable, key=lambda d: int(d.get("fileSize") or 0))
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+    def _download(self, url: str) -> bytes:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.content
+
+    @staticmethod
+    def _filename(photo: dict, url: str, idx: int) -> str:
+        base = url.split("?", 1)[0].rsplit("/", 1)[-1] or "photo.jpg"
+        guid = (photo.get("photoGuid") or f"idx{idx}")[:8]
+        return f"{guid}_{base}"
+
+    # -- public API ------------------------------------------------------------
+
     def scrape_photos(self) -> list[str]:
-        driver = self.setup_driver()
-        new_photos: list[str] = []
-
         try:
-            logger.info("Loading album: %s", self.album_url)
-            urls = self._collect_photo_urls(driver)
-            logger.info("Found %d potential photo elements", len(urls))
+            photos = self._fetch_stream()
+        except Exception as e:
+            logger.error("Failed to fetch album web-stream: %s", e)
+            return []
 
-            seen_hashes = self.state_store.seen_hashes()
+        logger.info("Album web-stream returned %d photo(s)", len(photos))
 
-            for idx, src in enumerate(urls):
-                normalized = self.normalize_url(src)
+        seen_guids = self.state_store.seen_guids()
+        # Oldest first, so batched emails arrive in chronological order.
+        new = sorted(
+            (p for p in photos if p.get("photoGuid") and p["photoGuid"] not in seen_guids),
+            key=lambda p: p.get("dateCreated", ""),
+        )
+        if not new:
+            logger.info("No new photos (all %d GUIDs already processed)", len(photos))
+            return []
+        logger.info("%d new photo(s) after GUID dedup", len(new))
 
-                # URL-level dedup: skip already-seen photos without downloading.
-                if self.state_store.is_url_processed(normalized):
-                    logger.debug("URL already processed, skipping download: %s", normalized)
-                    continue
+        # Choose the best derivative per photo, then resolve all URLs in bulk.
+        chosen: dict[str, tuple[str, dict]] = {}
+        for p in new:
+            deriv = self._best_derivative(p)
+            if deriv:
+                chosen[p["photoGuid"]] = (deriv["checksum"], p)
+            else:
+                logger.warning("No usable derivative for photo %s", p.get("photoGuid"))
 
-                try:
-                    photo_data = self._download_image(src)
-                except Exception as e:
-                    logger.error("Error downloading photo %d: %s", idx, e)
-                    continue
+        asset_urls = self._resolve_asset_urls(list(chosen.keys()))
 
-                photo_hash = self.get_photo_hash(photo_data)
+        seen_hashes = self.state_store.seen_hashes()
+        downloaded: list[str] = []
 
-                # Content-level dedup: same image served under a new signed URL.
-                if photo_hash in seen_hashes:
-                    self.state_store.mark_url_processed(normalized, photo_hash, src)
-                    logger.debug("Photo already processed (hash: %s...)", photo_hash[:8])
-                    continue
+        for idx, (guid, (checksum, photo)) in enumerate(chosen.items()):
+            url = asset_urls.get(checksum)
+            if not url:
+                logger.warning("No asset URL resolved for photo %s", guid)
+                continue
 
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"photo_{timestamp}_{idx}.jpg"
+            try:
+                data = self._download(url)
+            except Exception as e:
+                logger.error("Error downloading photo %s: %s", guid, e)
+                continue
+
+            photo_hash = self.get_photo_hash(data)
+            timestamp = photo.get("dateCreated") or datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Content-level dedup: same image re-added under a new GUID/URL.
+            if photo_hash in seen_hashes:
+                logger.debug("Photo %s already seen by content hash, skipping send", guid)
+            else:
+                filename = self._filename(photo, url, idx)
                 filepath = os.path.join(self.download_dir, filename)
                 with open(filepath, "wb") as f:
-                    f.write(photo_data)
+                    f.write(data)
 
-                self.state_store.add_photo(photo_hash, filename, src, timestamp)
-                self.state_store.mark_url_processed(normalized, photo_hash, src)
+                self.state_store.add_photo(photo_hash, filename, url, timestamp)
+                self.state_store.mark_url_processed(self.normalize_url(url), photo_hash, url)
                 seen_hashes.add(photo_hash)
-                new_photos.append(filepath)
+                downloaded.append(filepath)
                 logger.info("Downloaded new photo: %s", filename)
 
-        except Exception as e:
-            logger.error("Error during scraping: %s", e)
+            # Always record the GUID so it is never re-fetched, dup or not.
+            self.state_store.mark_guid_processed(guid, photo_hash)
 
-        finally:
-            driver.quit()
-
-        return new_photos
+        logger.info("Downloaded %d new photo file(s)", len(downloaded))
+        return downloaded

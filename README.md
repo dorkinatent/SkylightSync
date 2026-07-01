@@ -32,18 +32,12 @@ docker-compose down
 
 ## Manual Setup
 
-1. Install Chrome browser if not already installed
-
-2. Install Python dependencies:
+1. Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Install ChromeDriver:
-   - Mac: `brew install chromedriver`
-   - Or download from https://chromedriver.chromium.org/
-
-4. Configure email settings:
+2. Configure email settings:
    - Copy `.env.example` to `.env`
    - Add your email credentials (for Gmail, use an app-specific password)
 

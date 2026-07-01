@@ -1,11 +1,6 @@
 FROM python:3.11-slim
 
-# Install Chromium from Debian repos (avoids deprecated apt-key and Google's repo)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium \
-    chromium-driver \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# No browser needed: photos are fetched via the iCloud web-stream JSON API.
 
 # Set up working directory
 WORKDIR /app
@@ -19,8 +14,6 @@ COPY . .
 
 # Create directories for downloads and data
 RUN mkdir -p downloads data
-
-ENV CHROME_BIN=/usr/bin/chromium
 
 # Run as non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
