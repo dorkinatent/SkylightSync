@@ -120,15 +120,18 @@ def main() -> None:
             count_cap = args.batch_size if args.batch_size > 0 else len(pending)
             batches, oversized = plan_batches(pending, count_cap, MAX_ATTACHMENT_BYTES_PER_EMAIL)
 
-            # A single photo too large to email can never be delivered; record it
-            # so it isn't retried forever, and drop the download.
+            # A single photo too large to email can never be delivered. Mark only
+            # its GUID as handled so it isn't retried forever — do NOT record it
+            # in the delivered-photos/hash state (it was never sent).
             for item in oversized:
                 logger.warning(
                     "Photo %s is %d bytes — too large to email; skipping permanently",
                     item["filename"],
                     item["size"],
                 )
-                commit_and_cleanup(item)
+                scraper.state_store.mark_guid_processed(item["guid"], None)
+                if not args.keep_photos:
+                    _remove_files([item["path"]])
 
             sent = 0
             for i, batch in enumerate(batches, 1):

@@ -197,7 +197,8 @@ class ICloudPhotoScraper:
 
         asset_urls = self._resolve_asset_urls(list(chosen.keys()))
 
-        seen_hashes = self.state_store.seen_hashes()
+        committed_hashes = self.state_store.seen_hashes()
+        pending_hashes: set[str] = set()
         pending: list[dict] = []
 
         for idx, (guid, (checksum, photo)) in enumerate(chosen.items()):
@@ -222,19 +223,26 @@ class ICloudPhotoScraper:
             photo_hash = self.get_photo_hash(data)
             timestamp = photo.get("dateCreated") or datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            # Content-level dedup: same image re-added under a new GUID/URL.
-            # This is a confirmed duplicate (not pending a send), so commit the
-            # GUID immediately and don't queue it for email.
-            if photo_hash in seen_hashes:
-                logger.debug("Photo %s already seen by content hash, skipping send", guid)
+            # Content-level dedup against already-delivered photos: a new GUID/URL
+            # for content we've already committed. Safe to record this GUID now
+            # (the content is already on the frame) without re-sending.
+            if photo_hash in committed_hashes:
+                logger.debug("Photo %s duplicates already-delivered content; skipping", guid)
                 self.state_store.mark_guid_processed(guid, photo_hash)
+                continue
+
+            # Duplicate of something already queued this run but not yet sent:
+            # don't email it twice, and leave it UNcommitted so it's re-evaluated
+            # next run (by which point the original will be committed).
+            if photo_hash in pending_hashes:
+                logger.debug("Photo %s duplicates a queued photo; deferring", guid)
                 continue
 
             filename = self._filename(photo, url, idx)
             filepath = os.path.join(self.download_dir, filename)
             with open(filepath, "wb") as f:
                 f.write(data)
-            seen_hashes.add(photo_hash)
+            pending_hashes.add(photo_hash)
             pending.append(
                 {
                     "path": filepath,

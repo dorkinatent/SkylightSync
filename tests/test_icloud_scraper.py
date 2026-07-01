@@ -128,6 +128,32 @@ class TestDeferredCommit:
             assert scraper.scrape_photos() == []
 
 
+class TestSameRunDuplicate:
+    """Two GUIDs with identical content in one run: send once, don't commit the
+    alias before the original is delivered."""
+
+    def test_same_run_duplicate_is_deferred_not_committed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scraper = _scraper(tmpdir)
+            scraper._fetch_stream = lambda: [
+                {"photoGuid": "A", "derivatives": {"1": {"checksum": "ca", "fileSize": "3"}},
+                 "dateCreated": "2026-01-01T00:00:00Z"},
+                {"photoGuid": "B", "derivatives": {"1": {"checksum": "cb", "fileSize": "3"}},
+                 "dateCreated": "2026-01-02T00:00:00Z"},
+            ]
+            scraper._resolve_asset_urls = lambda guids: {
+                "ca": "https://x/A.JPG?s=t", "cb": "https://x/B.JPG?s=t"
+            }
+            scraper._download = lambda url: b"identical-bytes"  # same hash for both
+
+            pending = scraper.scrape_photos()
+
+            # Only the first is queued; the duplicate is skipped.
+            assert len(pending) == 1
+            # Neither GUID is committed yet (original still pending delivery).
+            assert scraper.state_store.seen_guids() == set()
+
+
 class TestDirectories:
     def test_creates_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
