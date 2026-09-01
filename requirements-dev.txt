@@ -1,4 +1,4 @@
 # Development and CI dependencies (test + lint). Runtime deps live in requirements.txt.
 -r requirements.txt
 pytest==9.1.1
-ruff==0.15.20
+ruff==0.16.5
