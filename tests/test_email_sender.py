@@ -1,8 +1,11 @@
 import os
+import smtplib
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from email_sender import EmailSender
+import pytest
+
+from email_sender import SMTP_TIMEOUT_SECONDS, EmailSender
 
 
 def _make_sender() -> EmailSender:
@@ -64,46 +67,68 @@ class TestBuildMessage:
             os.unlink(path)
 
 
-class TestBatchSplitting:
+@pytest.fixture
+def photo(tmp_path):
+    path = tmp_path / "p.jpg"
+    path.write_bytes(b"fake")
+    return str(path)
+
+
+@pytest.fixture(autouse=True)
+def no_retry_delay():
+    with patch("tenacity.nap.time.sleep"):
+        yield
+
+
+class TestSendOutcome:
     @patch("email_sender.smtplib.SMTP")
-    def test_batches_correct_count(self, mock_smtp_class):
-        mock_server = MagicMock()
-        mock_smtp_class.return_value = mock_server
-
-        sender = _make_sender()
-        paths = []
-        for i in range(7):
-            f = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-            f.write(b"fake")
-            f.close()
-            paths.append(f.name)
-
-        try:
-            sender.send_photos_in_batches("r@test.com", paths, batch_size=3)
-            # 7 photos / batch_size 3 = 3 batches (3, 3, 1)
-            assert mock_server.sendmail.call_count == 3
-        finally:
-            for p in paths:
-                os.unlink(p)
+    def test_success(self, smtp, photo):
+        assert _make_sender().send_photos("r@test.com", [photo]) is True
+        smtp.return_value.sendmail.assert_called_once()
 
     @patch("email_sender.smtplib.SMTP")
-    def test_single_smtp_connection(self, mock_smtp_class):
-        mock_server = MagicMock()
-        mock_smtp_class.return_value = mock_server
+    def test_failed_quit_after_send_still_counts_as_sent(self, smtp, photo):
+        """A failure here would re-send the batch on the next run."""
+        smtp.return_value.quit.side_effect = smtplib.SMTPServerDisconnected("dropped")
 
-        sender = _make_sender()
-        paths = []
-        for i in range(4):
-            f = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-            f.write(b"fake")
-            f.close()
-            paths.append(f.name)
+        assert _make_sender().send_photos("r@test.com", [photo]) is True
+        assert smtp.return_value.sendmail.call_count == 1
+        smtp.return_value.close.assert_called_once()
 
-        try:
-            sender.send_photos_in_batches("r@test.com", paths, batch_size=2)
-            # Only one SMTP connection should be created
-            mock_smtp_class.assert_called_once()
-            mock_server.login.assert_called_once()
-        finally:
-            for p in paths:
-                os.unlink(p)
+    @patch("email_sender.smtplib.SMTP")
+    def test_connection_has_a_timeout(self, smtp, photo):
+        _make_sender().send_photos("r@test.com", [photo])
+        assert smtp.call_args.kwargs["timeout"] == SMTP_TIMEOUT_SECONDS
+
+
+class TestRetries:
+    @patch("email_sender.smtplib.SMTP")
+    def test_temporary_rejection_retries_on_a_new_connection(self, smtp, photo):
+        smtp.return_value.sendmail.side_effect = [
+            smtplib.SMTPDataError(421, b"try later"),
+            {},
+        ]
+
+        assert _make_sender().send_photos("r@test.com", [photo]) is True
+        assert smtp.call_count == 2
+
+    @patch("email_sender.smtplib.SMTP")
+    def test_connection_errors_retry_then_fail(self, smtp, photo):
+        smtp.side_effect = TimeoutError("timed out")
+
+        assert _make_sender().send_photos("r@test.com", [photo]) is False
+        assert smtp.call_count == 3
+
+    @patch("email_sender.smtplib.SMTP")
+    def test_bad_credentials_are_not_retried(self, smtp, photo):
+        smtp.return_value.login.side_effect = smtplib.SMTPAuthenticationError(535, b"bad password")
+
+        assert _make_sender().send_photos("r@test.com", [photo]) is False
+        assert smtp.call_count == 1
+
+    @patch("email_sender.smtplib.SMTP")
+    def test_message_too_large_is_not_retried(self, smtp, photo):
+        smtp.return_value.sendmail.side_effect = smtplib.SMTPDataError(552, b"too large")
+
+        assert _make_sender().send_photos("r@test.com", [photo]) is False
+        assert smtp.call_count == 1

@@ -9,6 +9,7 @@ store. Two tables back two layers of dedup:
                      is still recognised as already-seen.
 """
 
+import fcntl
 import json
 import logging
 import os
@@ -45,6 +46,23 @@ class StateStore:
             conn.commit()
         finally:
             conn.close()
+
+    @contextmanager
+    def exclusive_run(self) -> Iterator[bool]:
+        """Try to take the single-sync lock; yields whether it was acquired.
+
+        Two overlapping syncs would both see the same photos as unsent and email
+        them twice. The OS drops a flock when its holder exits, even on a crash,
+        so a dead process can't leave a stale lock. It only coordinates processes
+        on the same host, not a container and its host across a Docker Desktop
+        bind mount."""
+        with open(f"{self.db_path}.lock", "w") as lock_file:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            yield True
 
     def _initialize(self) -> None:
         with self._connection() as conn:

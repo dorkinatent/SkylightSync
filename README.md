@@ -102,6 +102,23 @@ Custom batch size:
 python skylight_sync.py --batch-size 10  # Send 10 photos per email
 ```
 
+### First run and safeguards
+
+Syncing refuses to send anything while `data/skylight.db` has no processed
+photos, because all it can tell is that the whole album looks new. That usually
+means a wrong volume path, and sending would flood the frame with duplicates.
+
+- **Moving an existing install:** copy `data/skylight.db` to the new location
+  and run normally.
+- **New install, send the whole album:** run once with `--allow-initial-sync`.
+- **New install, send only future photos:** run
+  `python backfill_guids.py --force`, which marks everything currently in the
+  album as already sent.
+
+Each sync also sends at most 200 photos (change with `--max-per-run`, 0 = no
+limit). Anything over the cap goes out, oldest first, on later runs. Only one sync
+can run at a time on a host; a second one logs a warning and skips.
+
 ## Scheduling (cron)
 
 `run_skylight_sync.sh` runs a single sync and exits — the shape cron expects. It
@@ -113,6 +130,9 @@ Example crontab entry — sync every day at 7am and append output to a log:
 ```cron
 0 7 * * * /path/to/SkylightSync/run_skylight_sync.sh >> /path/to/SkylightSync/cron.log 2>&1
 ```
+
+With `--once`, the exit code is `0` on success and `1` if the album fetch, a
+download, or a send failed, so a scheduler or monitoring tool can alert on it.
 
 ## Email Setup for Gmail
 

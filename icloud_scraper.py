@@ -44,6 +44,10 @@ _HEADERS = {
 _GUID_CHUNK = 25
 
 
+class InitialSyncRefused(Exception):
+    """The dedup state is empty, so every photo in the album looks new."""
+
+
 class ICloudPhotoScraper:
     def __init__(
         self,
@@ -65,6 +69,8 @@ class ICloudPhotoScraper:
         self.session = requests.Session()
         self.session.headers.update(_HEADERS)
         self._host: str | None = None
+        # Photos from the latest scrape that failed to download (retried next run).
+        self.download_failures = 0
 
     @staticmethod
     def _parse_token(album_url: str) -> str:
@@ -144,7 +150,7 @@ class ICloudPhotoScraper:
     def _is_video(photo: dict) -> bool:
         return photo.get("mediaAssetType") == "video"
 
-    def scrape_photos(self) -> list[dict]:
+    def scrape_photos(self, max_photos: int = 0, allow_initial_sync: bool = False) -> list[dict]:
         """Download new (non-video) photos and return uncommitted descriptors.
 
         State is intentionally NOT written for successfully downloaded photos:
@@ -155,12 +161,18 @@ class ICloudPhotoScraper:
 
         Each returned item is a dict with keys: path, filename, guid, hash, url,
         normalized, timestamp, size.
+
+        At most ``max_photos`` photos (oldest first) are processed per call; the
+        rest wait for later runs. 0 means no limit.
+
+        Raises if the album can't be fetched, so a broken album or API change
+        reads as a failure rather than "no new photos". Raises
+        ``InitialSyncRefused`` if nothing has ever been processed, unless
+        ``allow_initial_sync`` is set: an empty database more likely means a
+        wrong volume path than a new install, and would re-send the whole album.
         """
-        try:
-            photos = self._fetch_stream()
-        except Exception as e:
-            logger.error("Failed to fetch album web-stream: %s", e)
-            return []
+        self.download_failures = 0
+        photos = self._fetch_stream()
 
         logger.info("Album web-stream returned %d photo(s)", len(photos))
 
@@ -181,6 +193,21 @@ class ICloudPhotoScraper:
             logger.info("No new photos to send")
             return []
         logger.info("%d new photo(s) after GUID dedup", len(new))
+
+        if not seen_guids and not allow_initial_sync:
+            raise InitialSyncRefused(
+                f"The dedup database is empty, so all {len(new)} photo(s) in the album look new. "
+                "If you moved or mounted data/, check that skylight.db is there. To really send "
+                "the whole album, re-run with --allow-initial-sync."
+            )
+
+        if max_photos > 0 and len(new) > max_photos:
+            logger.warning(
+                "Limiting this run to the oldest %d of %d new photo(s); the rest wait for later runs",
+                max_photos,
+                len(new),
+            )
+            new = new[:max_photos]
 
         # Choose the best derivative per photo, then resolve all URLs in bulk.
         # A photo with no usable derivative is structurally unsupported (not a
@@ -218,6 +245,7 @@ class ICloudPhotoScraper:
             except Exception as e:
                 # Transient: leave unmarked so it retries on the next run.
                 logger.error("Error downloading photo %s: %s", guid, e)
+                self.download_failures += 1
                 continue
 
             photo_hash = self.get_photo_hash(data)
